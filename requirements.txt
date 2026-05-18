@@ -8,3 +8,7 @@ streamlit>=1.35
 matplotlib>=3.8
 plotly>=5.20
 cbbd>=1.0.0
+# video pipeline
+opencv-python>=4.8
+rtmlib>=0.0.15
+ultralytics>=8.0

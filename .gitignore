@@ -1,11 +1,28 @@
-# Database (too large for GitHub, regenerate via pipeline)
+# ── Databases & model artifacts (regenerate via pipeline) ─────────────────────
 data/nba_shots.db
+data/xpts_model.pkl
+data/xpts_encoders.pkl
 
-# API keys / secrets
+# ── Large binary weights (auto-download via ultralytics / yt-dlp) ─────────────
+yolo11n.pt
+yolov8n.pt
+
+# ── Training datasets (large; model already trained) ──────────────────────────
+basketball-player-detection-2-Forked*/
+data/action_classifier_yolo/
+
+# ── Per-player video data (too large for git) ─────────────────────────────────
+video/*/
+
+# ── Secrets & local config ────────────────────────────────────────────────────
 .env
 *.env
+.streamlit/secrets.toml
 
-# Python
+# ── Claude Code internal files ────────────────────────────────────────────────
+.claude/
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
@@ -15,20 +32,17 @@ dist/
 build/
 .eggs/
 
-# Virtual environments
+# ── Virtual environments ──────────────────────────────────────────────────────
 venv/
 env/
 .venv/
 
-# Jupyter
+# ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 
-# macOS
+# ── macOS ─────────────────────────────────────────────────────────────────────
 .DS_Store
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
-
-# Streamlit
-.streamlit/secrets.toml

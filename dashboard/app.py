@@ -4,7 +4,7 @@
 Pages (sidebar):
   🏆 Draft Board    — ranked leaderboard with sortable columns + headshots
   👤 Player Profile — bio card + shot analysis + player comps
-  📄 Shooting Report — per-player PDF preview & download
+  📄 Shooting Report — per-player shooting profile & metrics
 """
 
 import io
@@ -17,7 +17,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Circle, Rectangle, Arc
 import plotly.graph_objects as go
 from sklearn.preprocessing import StandardScaler
@@ -26,7 +25,14 @@ import streamlit as st
 DB_PATH       = Path(__file__).resolve().parent.parent / "data" / "nba_shots.db"
 BIOS_PATH     = Path(__file__).resolve().parent.parent / "data" / "prospect_bios.json"
 INTL_PATH     = Path(__file__).resolve().parent.parent / "data" / "international_stats.json"
+COMBINE_PATH  = Path(__file__).resolve().parent.parent / "data" / "combine_2026.json"
 TARGET_SEASON = "2025-26"
+
+# Combine uses legal names; map to names used in the shots DB / prospect list
+_COMBINE_NAME_MAP = {
+    "Anicet Dybantsa":       "AJ Dybantsa",
+    "Christopher Brown Jr":  "Mikel Brown Jr.",
+}
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline"))
 try:
@@ -174,6 +180,43 @@ def load_intl_stats() -> dict:
     if INTL_PATH.exists():
         return json.loads(INTL_PATH.read_text())
     return {}
+
+
+@st.cache_data(ttl=3600)
+def _to_float(v):
+    """Convert a combine field value to float, leave strings that aren't numeric as-is."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return v
+
+
+def load_combine() -> dict:
+    """Returns dict: player_name (shots-DB spelling) → combine row dict."""
+    if not COMBINE_PATH.exists():
+        return {}
+    records = json.loads(COMBINE_PATH.read_text())
+    result = {}
+    for r in records:
+        name = r.get("PLAYER_NAME", "")
+        mapped = _COMBINE_NAME_MAP.get(name, name)
+        result[mapped] = {k: _to_float(v) for k, v in r.items()}
+    return result
+
+
+def _combine_rank(combine: dict, field: str, value, lower_is_better: bool = False) -> str:
+    """Return 'Xth percentile' rank of value within combine participants."""
+    if value is None:
+        return ""
+    vals = [r[field] for r in combine.values() if r.get(field) is not None]
+    if not vals:
+        return ""
+    rank = sum(v < value for v in vals) / len(vals)
+    if lower_is_better:
+        rank = 1 - rank
+    return f"{rank:.0%} pct"
 
 
 def age_from_dob(dob: str) -> str:
@@ -569,19 +612,29 @@ def _h2h_table(ma: dict, mb: dict, name_a: str, name_b: str) -> None:
         try:    return f"{v:{fmt}}"
         except: return "—"
 
-    def norm_bars(va, vb, hb):
-        """Map both values to [10,90] so winner always has longer bar."""
-        if va is None and vb is None:
-            return 50.0, 50.0
-        va0 = va if va is not None else vb
-        vb0 = vb if vb is not None else va
-        lo, hi = min(va0, vb0), max(va0, vb0)
-        if abs(hi - lo) < 1e-9:
-            return 50.0, 50.0
-        na = (va0 - lo) / (hi - lo) * 80 + 10
-        nb = (vb0 - lo) / (hi - lo) * 80 + 10
-        if not hb:          # lower is better → invert
-            na, nb = 100 - na, 100 - nb
+    # Realistic domain for each metric — bars are proportional to actual values
+    _DOMAINS = {
+        "FGA":     (0,    500),
+        "FG%":     (0.20, 0.65),
+        "3P%":     (0.0,  0.55),
+        "3PAr":    (0.0,  1.0),
+        "eFG%":    (0.25, 0.75),
+        "FT%":     (0.30, 1.0),
+        "PAE/100": (-15,  20),
+        "Avg Dist":(5,    28),
+    }
+
+    def norm_bars(va, vb, key, hb):
+        """Scale values to [0,100] within a realistic domain for the metric."""
+        lo, hi = _DOMAINS.get(key, (0, 1))
+        def scale(v):
+            if v is None:
+                return 0.0
+            return max(2.0, min(100.0, (v - lo) / (hi - lo) * 100))
+        na, nb = scale(va), scale(vb)
+        if not hb:   # lower is better → invert so shorter bar = worse
+            na = 102.0 - na
+            nb = 102.0 - nb
         return na, nb
 
     labels, bar_a, bar_b = [], [], []
@@ -603,7 +656,7 @@ def _h2h_table(ma: dict, mb: dict, name_a: str, name_b: str) -> None:
         a_wins = (va > vb) if (hb and va is not None and vb is not None) else \
                  (va < vb) if (not hb and va is not None and vb is not None) else None
 
-        na, nb = norm_bars(va, vb, hb)
+        na, nb = norm_bars(va, vb, key, hb)
         labels.append(label)
         bar_a.append(-na)   # negative → goes left
         bar_b.append(nb)    # positive → goes right
@@ -1726,120 +1779,6 @@ def _radar_fig(scores: dict, player_name: str, figsize=(5, 5)) -> go.Figure:
     return fig
 
 
-def _generate_pdf(player_name: str, s, pdata: pd.DataFrame,
-                  row, bios: dict) -> bytes:
-    buf = io.BytesIO()
-    with PdfPages(buf) as pdf:
-        fig = plt.figure(figsize=(8.5, 11), facecolor="white")
-        fig.patch.set_facecolor("white")
-
-        meta = PROSPECT_META.get(player_name, {})
-        bio  = bios.get(player_name, {})
-
-        fig.text(0.5, 0.97, "2026 NBA Draft  ·  Shooting Quality Report",
-                 ha="center", fontsize=11, color="#555")
-        fig.text(0.5, 0.93, player_name, ha="center",
-                 fontsize=22, fontweight="bold", color="#1a1a2e")
-        subtitle = (f"{meta.get('team', '')}  ·  {bio.get('position', '')}  "
-                    f"·  #{meta.get('rank', '?')} Overall")
-        fig.text(0.5, 0.90, subtitle, ha="center", fontsize=11, color="#f0b429")
-
-        # Radar (left)
-        ax_r = fig.add_axes([0.04, 0.60, 0.38, 0.28], polar=True)
-        keys = ["making", "range", "at_rim", "shot_diet", "consistency"]
-        dims = ["Making\nPAE/100", "Range\n3PAr×3P%", "At-Rim\nRA FG%",
-                "Shot Diet\nDifficulty", "Consistency\nStability"]
-        vals = [float(s.get(k) or 50) for k in keys]
-        N    = len(dims)
-        ang  = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
-        ax_r.set_ylim(0, 100)
-        ax_r.set_yticks([25, 50, 75, 100])
-        ax_r.set_yticklabels(["25","50","75","100"], fontsize=5, color="#bbb")
-        ax_r.set_xticks(ang)
-        ax_r.set_xticklabels(dims, fontsize=6, fontweight="bold", color="#1a1a2e")
-        v2 = vals+vals[:1]; a2 = ang+ang[:1]
-        ax_r.plot(a2, [50]*N+[50], color="#4a90d9", lw=1, ls="--", alpha=0.5)
-        ax_r.plot(a2, v2, color="#f0b429", lw=2)
-        ax_r.fill(a2, v2, color="#f0b429", alpha=0.2)
-        ax_r.grid(color="#dee2e6", lw=0.6)
-        ax_r.set_facecolor("#f8f9fa")
-        ax_r.set_title("Shooting Profile", fontsize=9, color="#1a1a2e", pad=10)
-
-        # Metrics table (right)
-        ax_t = fig.add_axes([0.50, 0.62, 0.44, 0.24])
-        ax_t.axis("off")
-        fga  = int(row.get("total_shots", 0)) if hasattr(row, "get") else int(getattr(row, "total_shots", 0))
-        fg_p = row.get("fg_pct", 0) if hasattr(row, "get") else getattr(row, "fg_pct", 0)
-        pae_ = row.get("shrunk_pae_per100", np.nan) if hasattr(row, "get") else getattr(row, "shrunk_pae_per100", np.nan)
-        par_ = row.get("pct_3pt", 0) if hasattr(row, "get") else getattr(row, "pct_3pt", 0)
-        d_   = row.get("avg_shot_dist", 0) if hasattr(row, "get") else getattr(row, "avg_shot_dist", 0)
-        tbl_data = [
-            ["FGA",            f"{fga:,}"],
-            ["FG%",            f"{fg_p:.1%}"],
-            ["Shrunk PAE/100", f"{pae_:+.1f}" if pd.notna(pae_) else "—"],
-            ["3PAr",           f"{par_:.1%}"],
-            ["Avg Shot Dist",  f"{d_:.1f} ft"],
-        ]
-        tbl = ax_t.table(cellText=tbl_data, colLabels=["Metric", "Value"],
-                         cellLoc="left", loc="center", bbox=[0, 0, 1, 1])
-        tbl.auto_set_font_size(False); tbl.set_fontsize(9)
-        for (r, c), cell in tbl.get_celld().items():
-            cell.set_edgecolor("#dee2e6")
-            if r == 0:
-                cell.set_facecolor("#1a1a2e")
-                cell.set_text_props(color="white", fontweight="bold")
-            else:
-                cell.set_facecolor("#f5f7fa" if r % 2 == 0 else "white")
-
-        # Zone frequency (bottom left)
-        if not pdata.empty:
-            ax_z = fig.add_axes([0.04, 0.27, 0.42, 0.28])
-            ax_z.set_facecolor("#f5f7fa")
-            z = (pdata.groupby("shot_zone_basic")["shot_attempted"].sum()
-                 .reindex(ZONE_ORDER, fill_value=0))
-            freq = z / z.sum()
-            ax_z.barh(np.arange(len(ZONE_ORDER)), freq.values, color="#f0b429", alpha=0.85)
-            ax_z.set_yticks(np.arange(len(ZONE_ORDER)))
-            ax_z.set_yticklabels([s[:18] for s in ZONE_ORDER], fontsize=6)
-            ax_z.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
-            ax_z.set_title("Shot Zone Frequency", fontsize=9, color="#1a1a2e")
-            ax_z.spines[:].set_color("#dee2e6")
-            ax_z.tick_params(colors="#555")
-
-        # Actual vs xFG% by zone (bottom right)
-        has_pm = "p_make" in pdata.columns and pdata["p_make"].notna().any()
-        if has_pm and not pdata.empty:
-            ax_fg = fig.add_axes([0.54, 0.27, 0.42, 0.28])
-            ax_fg.set_facecolor("#f5f7fa")
-            zq = pdata.groupby("shot_zone_basic").agg(
-                actual=("shot_made", "mean"),
-                xfg=("p_make", "mean"),
-                att=("shot_attempted", "sum"),
-            ).reindex(ZONE_ORDER).dropna()
-            zq = zq[zq["att"] >= 5]
-            x  = np.arange(len(zq))
-            ax_fg.bar(x-0.2, zq["actual"].values, 0.35, color="#f0b429", label="Actual FG%")
-            ax_fg.bar(x+0.2, zq["xfg"].values,    0.35, color="#4a90d9", label="xFG%", alpha=0.8)
-            ax_fg.set_xticks(x)
-            ax_fg.set_xticklabels([s[:10] for s in zq.index],
-                                  rotation=30, ha="right", fontsize=6)
-            ax_fg.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
-            ax_fg.set_title("Actual vs xFG% by Zone", fontsize=9, color="#1a1a2e")
-            ax_fg.legend(fontsize=7, facecolor="white")
-            ax_fg.spines[:].set_color("#dee2e6")
-            ax_fg.tick_params(colors="#555")
-
-        fig.text(0.5, 0.02,
-                 f"Generated · {date.today().strftime('%B %d, %Y')}  ·  "
-                 "NBA Draft Shot Quality Portal",
-                 ha="center", fontsize=7, color="#aaa")
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-    buf.seek(0)
-    return buf.read()
-
-
 def page_shooting_report(shots: pd.DataFrame, summary: pd.DataFrame,
                          bios: dict,
                          box_scores: pd.DataFrame | None = None) -> None:
@@ -2055,23 +1994,6 @@ def page_shooting_report(shots: pd.DataFrame, summary: pd.DataFrame,
         else:
             st.info("Run `python models/xpts_model.py` for consistency data.")
 
-    # ── PDF download ──────────────────────────────────────────────────────────
-    st.markdown("---")
-    section_header("Download Report")
-    st.caption("One-page PDF: shooting profile radar, zone breakdown, and key metrics.")
-
-    if st.button("Generate PDF", type="primary"):
-        with st.spinner("Building report…"):
-            try:
-                pdf_bytes = _generate_pdf(player, s, pdata, row, bios)
-                st.download_button(
-                    label="📥  Download PDF",
-                    data=pdf_bytes,
-                    file_name=f"{player.replace(' ', '_')}_shooting_report.pdf",
-                    mime="application/pdf",
-                )
-            except Exception as e:
-                st.error(f"PDF generation failed: {e}")
 
 
 # ── New Page: Draft Board ─────────────────────────────────────────────────────
@@ -2092,6 +2014,7 @@ def page_draft_board(shots: pd.DataFrame, summary: pd.DataFrame,
 
     with ctrl1:
         sort_options = {
+            "Draft Order": "__rank__",
             "PAE/100 (Shot Quality)": sort_col,
             "FG%": "fg_pct",
             "3PT Attempt Rate": "pct_3pt",
@@ -2123,7 +2046,13 @@ def page_draft_board(shots: pd.DataFrame, summary: pd.DataFrame,
             lambda n: PROSPECT_META.get(n, {}).get("position", "") in pos_filter
         )]
 
-    if sort_by in df.columns:
+    if sort_by == "__rank__":
+        df["__rank__"] = df["player_name"].map(
+            lambda n: PROSPECT_META.get(n, {}).get("rank", 9999)
+        )
+        df = df.sort_values("__rank__", ascending=True, na_position="last")
+        df = df.drop(columns=["__rank__"])
+    elif sort_by in df.columns:
         ascending = sort_by == "avg_shot_dist"
         df = df.sort_values(sort_by, ascending=ascending, na_position="last")
     df = df.reset_index(drop=True)
@@ -2215,20 +2144,19 @@ def page_draft_board(shots: pd.DataFrame, summary: pd.DataFrame,
             st.session_state["_nav_request"] = "👤 Player Dossier"
             st.rerun()
 
-    # ── Open Player Dossier (fallback button) ────────────────────────────────
+    # ── Metric glossary ───────────────────────────────────────────────────────
     st.markdown("---")
-    all_names = df["player_name"].tolist() if not df.empty else summary["player_name"].tolist()
-    doss_col1, doss_col2 = st.columns([4, 1])
-    with doss_col1:
-        dossier_sel = st.selectbox("Open Player Dossier →", all_names,
-                                   key="db_dossier_sel",
-                                   label_visibility="visible")
-    with doss_col2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("View →", type="primary", key="db_view_btn"):
-            st.session_state["dossier_player"] = dossier_sel
-            st.session_state["_nav_request"] = "👤 Player Dossier"
-            st.rerun()
+    st.caption(
+        "**PAE/100** — Points Above Expected per 100 shot attempts. "
+        "Compares each shot's actual outcome to the xPTS model's prediction given shot location, "
+        "distance, and shot type. Positive = shooting above expectation. "
+        "**Shrunk** = Bayesian regression toward the mean to reduce noise for players with fewer attempts.  ·  "
+        "**FG%** — Field goal percentage (all shots).  ·  "
+        "**3P%** — 3-point field goal percentage.  ·  "
+        "**FT%** — Free throw percentage.  ·  "
+        "**3PAr** — 3-point attempt rate: share of all FGA taken from beyond the arc.  ·  "
+        "**Grade** — Shot-making letter grade derived from PAE/100 percentile rank within the prospect pool."
+    )
 
 
 # ── New Page: Player Dossier ──────────────────────────────────────────────────
@@ -2236,15 +2164,21 @@ def page_draft_board(shots: pd.DataFrame, summary: pd.DataFrame,
 def page_player_dossier(shots: pd.DataFrame, summary: pd.DataFrame,
                         all_ncaa_summary: pd.DataFrame, bios: dict,
                         intl_stats: dict, all_scores: pd.DataFrame,
-                        box_scores: pd.DataFrame | None = None) -> None:
+                        box_scores: pd.DataFrame | None = None,
+                        combine: dict | None = None) -> None:
     if summary.empty:
         st.warning("No data available.")
         return
 
-    sort_col = "shrunk_pae_per100" if "shrunk_pae_per100" in summary.columns else "pts_above_exp"
-    ordered  = summary.sort_values(sort_col, ascending=False)["player_name"].tolist()
-    intl_only = [n for n in intl_stats if n not in ordered]
-    ordered   = ordered + intl_only
+    def _draft_rank(name: str) -> int:
+        return PROSPECT_META.get(name, {}).get("rank", 9999)
+
+    all_prospect_names = [p["name"] for p in ALL_PROSPECTS] if ALL_PROSPECTS else []
+    ordered = sorted(all_prospect_names, key=_draft_rank)
+    # Append any intl players not already in the list
+    for n in intl_stats:
+        if n not in ordered:
+            ordered.append(n)
 
     default_player = st.session_state.get("dossier_player")
     if default_player in ordered:
@@ -2281,7 +2215,7 @@ def page_player_dossier(shots: pd.DataFrame, summary: pd.DataFrame,
     s = score_row.iloc[0] if not score_row.empty else None
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3 = st.tabs(["📊 Overview", "🎯 Shot Analysis", "🔍 Comps"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🎯 Shot Analysis", "🔍 Comps", "🏋️ Combine"])
 
     # ── Tab 1: Overview ───────────────────────────────────────────────────────
     with tab1:
@@ -2634,23 +2568,57 @@ def page_player_dossier(shots: pd.DataFrame, summary: pd.DataFrame,
                 </div>
                 """, unsafe_allow_html=True)
 
-    # ── PDF download (outside tabs) ───────────────────────────────────────────
-    st.markdown("---")
-    section_header("Download Report")
-    st.caption("One-page PDF: shooting profile radar, zone breakdown, and key metrics.")
+    # ── Tab 4: Combine ────────────────────────────────────────────────────────
+    with tab4:
+        combine = combine or {}
+        cdata = combine.get(player)
+        if cdata is None:
+            st.info("No 2026 NBA Draft Combine data for this player.")
+        else:
+            def _v(key, fmt="{}", fallback="—"):
+                val = cdata.get(key)
+                return fmt.format(val) if val is not None else fallback
 
-    if s is not None and st.button("Generate PDF", type="primary", key="dossier_pdf_btn"):
-        with st.spinner("Building report…"):
-            try:
-                pdf_bytes = _generate_pdf(player, s, pdata, row, bios)
-                st.download_button(
-                    label="📥  Download PDF",
-                    data=pdf_bytes,
-                    file_name=f"{player.replace(' ', '_')}_shooting_report.pdf",
-                    mime="application/pdf",
-                )
-            except Exception as e:
-                st.error(f"PDF generation failed: {e}")
+            # ── Physical Measurements ─────────────────────────────────────────
+            section_header("Physical Measurements")
+            p1, p2, p3, p4, p5 = st.columns(5)
+            metric_card(p1, "Height", _v("HEIGHT_WO_SHOES_FT_IN"), "Without shoes")
+            metric_card(p2, "Wingspan", _v("WINGSPAN_FT_IN"),
+                        _combine_rank(combine, "WINGSPAN", cdata.get("WINGSPAN")))
+            metric_card(p3, "Standing Reach", _v("STANDING_REACH_FT_IN"),
+                        _combine_rank(combine, "STANDING_REACH", cdata.get("STANDING_REACH")))
+            metric_card(p4, "Weight",
+                        f"{cdata['WEIGHT']:.0f} lbs" if cdata.get("WEIGHT") else "—", "lbs")
+            hl = cdata.get("HAND_LENGTH")
+            hw = cdata.get("HAND_WIDTH")
+            metric_card(p5, "Hand Size",
+                        f'{hl:.2f}" × {hw:.2f}"' if hl and hw else "—",
+                        "Length × Width")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # ── Athleticism ───────────────────────────────────────────────────
+            section_header("Athleticism")
+            a1, a2, a3, a4, a5 = st.columns(5)
+            metric_card(a1, "Standing Vert",
+                        f'{cdata["STANDING_VERTICAL_LEAP"]:.1f}"' if cdata.get("STANDING_VERTICAL_LEAP") else "—",
+                        _combine_rank(combine, "STANDING_VERTICAL_LEAP", cdata.get("STANDING_VERTICAL_LEAP")))
+            metric_card(a2, "Max Vertical",
+                        f'{cdata["MAX_VERTICAL_LEAP"]:.1f}"' if cdata.get("MAX_VERTICAL_LEAP") else "—",
+                        _combine_rank(combine, "MAX_VERTICAL_LEAP", cdata.get("MAX_VERTICAL_LEAP")))
+            metric_card(a3, "Lane Agility",
+                        f'{cdata["LANE_AGILITY_TIME"]:.2f}s' if cdata.get("LANE_AGILITY_TIME") else "—",
+                        _combine_rank(combine, "LANE_AGILITY_TIME", cdata.get("LANE_AGILITY_TIME"), lower_is_better=True))
+            metric_card(a4, "Mod. Agility",
+                        f'{cdata["MODIFIED_LANE_AGILITY_TIME"]:.2f}s' if cdata.get("MODIFIED_LANE_AGILITY_TIME") else "—",
+                        _combine_rank(combine, "MODIFIED_LANE_AGILITY_TIME", cdata.get("MODIFIED_LANE_AGILITY_TIME"), lower_is_better=True))
+            metric_card(a5, "¾ Sprint",
+                        f'{cdata["THREE_QUARTER_SPRINT"]:.2f}s' if cdata.get("THREE_QUARTER_SPRINT") else "—",
+                        _combine_rank(combine, "THREE_QUARTER_SPRINT", cdata.get("THREE_QUARTER_SPRINT"), lower_is_better=True))
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+
 
 
 # ── New Page: Head-to-Head ────────────────────────────────────────────────────
@@ -2658,13 +2626,21 @@ def page_player_dossier(shots: pd.DataFrame, summary: pd.DataFrame,
 def page_h2h(shots: pd.DataFrame, summary: pd.DataFrame,
              bios: dict, intl_stats: dict,
              all_scores: pd.DataFrame,
-             box_scores: pd.DataFrame | None = None) -> None:
+             box_scores: pd.DataFrame | None = None,
+             combine: dict | None = None) -> None:
     st.markdown("## ⚖️ Head-to-Head")
 
-    sort_col     = "shrunk_pae_per100" if "shrunk_pae_per100" in summary.columns else "pts_above_exp"
-    ncaa_ordered = summary.sort_values(sort_col, ascending=False)["player_name"].tolist()
-    intl_ordered = [n for n in intl_stats if n not in ncaa_ordered]
-    all_ordered  = ncaa_ordered + intl_ordered
+    def _h2h_rank(name: str) -> int:
+        return PROSPECT_META.get(name, {}).get("rank", 9999)
+
+    all_ordered = sorted(
+        ([p["name"] for p in ALL_PROSPECTS] if ALL_PROSPECTS else
+         list(set(summary["player_name"].tolist()) | set(intl_stats.keys()))),
+        key=_h2h_rank,
+    )
+    for n in intl_stats:
+        if n not in all_ordered:
+            all_ordered.append(n)
 
     def pos_of(name): return PROSPECT_META.get(name, {}).get("position", "")
 
@@ -2775,6 +2751,494 @@ def page_h2h(shots: pd.DataFrame, summary: pd.DataFrame,
         fig = _pae_dist_fig(all_pae, hl)
         st.plotly_chart(fig, use_container_width=True)
 
+    # ── Combine: Physical & Athleticism ───────────────────────────────────────
+    combine = combine or {}
+    ca_data = combine.get(player_a)
+    cb_data = combine.get(player_b)
+    if ca_data or cb_data:
+        section_header("NBA Draft Combine — Physical & Athleticism")
+
+        def _cv(d, key, fmt):
+            val = (d or {}).get(key)
+            return fmt.format(val) if val is not None else "—"
+
+        rows = [
+            ("Height (no shoes)",  "HEIGHT_WO_SHOES_FT_IN", "{}",        False),
+            ("Wingspan",           "WINGSPAN_FT_IN",         "{}",        False),
+            ("Standing Reach",     "STANDING_REACH_FT_IN",   "{}",        False),
+            ("Weight (lbs)",       "WEIGHT",                 "{:.0f}",    False),
+            ("Standing Vertical",  "STANDING_VERTICAL_LEAP", '{:.1f}"',   False),
+            ("Max Vertical",       "MAX_VERTICAL_LEAP",      '{:.1f}"',   False),
+            ("Lane Agility",       "LANE_AGILITY_TIME",      "{:.2f}s",   True),
+            ("¾ Sprint",           "THREE_QUARTER_SPRINT",   "{:.2f}s",   True),
+            ("Spot 3PT% (college)","COLLEGE_TOP_KEY_PCT",    "{:.0%}",    False),
+            ("Off-Drib 3PT%",      "OFF_DRIB_COLLEGE_TOP_KEY_PCT", "{:.0%}", False),
+            ("On-Move 3PT%",       "ON_MOVE_COLLEGE_PCT",    "{:.0%}",    False),
+        ]
+
+        html = f"""
+        <table class="h2h-table">
+        <thead><tr>
+          <th style="color:#f0b429;padding:6px 4px;text-align:right;width:38%">{player_a.split()[-1]}</th>
+          <th style="padding:6px 8px;text-align:center;color:#999;font-size:11px;width:24%">Metric</th>
+          <th style="color:#4a90d9;padding:6px 4px;text-align:left;width:38%">{player_b.split()[-1]}</th>
+        </tr></thead><tbody>
+        """
+        for label, key, fmt, lower_better in rows:
+            va_raw = (ca_data or {}).get(key)
+            vb_raw = (cb_data or {}).get(key)
+            va_s = fmt.format(va_raw) if va_raw is not None else "—"
+            vb_s = fmt.format(vb_raw) if vb_raw is not None else "—"
+            if va_raw is not None and vb_raw is not None:
+                a_wins = (va_raw < vb_raw) if lower_better else (va_raw > vb_raw)
+                col_a = "#f0b429" if a_wins else "#555"
+                col_b = "#4a90d9" if not a_wins else "#555"
+            else:
+                col_a = col_b = "#555"
+            html += f"""<tr>
+              <td style="text-align:right;font-size:15px;font-weight:700;color:{col_a};padding:5px 4px">{va_s}</td>
+              <td style="text-align:center;color:#999;font-size:11px;padding:5px 8px">{label}</td>
+              <td style="text-align:left;font-size:15px;font-weight:700;color:{col_b};padding:5px 4px">{vb_s}</td>
+            </tr>"""
+        html += "</tbody></table>"
+        st.markdown(html, unsafe_allow_html=True)
+
+
+# ── Page: Shot Mechanics ──────────────────────────────────────────────────────
+
+VIDEO_DIR = Path(__file__).resolve().parent.parent / "video"
+
+# Map display name → video folder name (only players with pose data)
+MECHANICS_PLAYERS: dict[str, str | None] = {
+    "Cameron Boozer":    "1_Cameron_Boozer",
+    "Darryn Peterson":   "2_Darryn_Peterson",
+    "AJ Dybantsa":       "3_AJ_Dybantsa",
+    "Caleb Wilson":      "4_Caleb_Wilson",
+    "Mikel Brown Jr.":   "5_Mikel_Brown_Jr.",
+    "Kingston Flemings": "6_Kingston_Flemings",
+    "Bennett Stirtz":    "10_Bennett_Stirtz",
+    # < 10 pose clips — excluded until more footage reviewed
+    "Hannes Steinbach":  None,
+    "Koa Peat":          None,
+    "Labaron Philon":    None,
+}
+
+METRICS_META = {
+    "knee_angle":  {"label": "Knee Angle (°)",  "color": "#e8854c"},
+    "elbow_angle": {"label": "Elbow Angle (°)", "color": "#4c9ee8"},
+    "body_lean":   {"label": "Body Lean (°)",   "color": "#c84ce8"},
+}
+
+METRIC_DESCRIPTIONS = {
+    "knee_angle":  "Shooting-side knee angle (hip→knee→ankle). Drops during load, extends explosively at takeoff. Most predictive of shot quality.",
+    "elbow_angle": "Shooting-side elbow angle (shoulder→elbow→wrist). Shows arm cocking during load and extension toward release.",
+    "body_lean":   "Torso tilt from vertical. Negative = leaning left, positive = leaning right. Ideally stays near 0° (upright) at release.",
+}
+
+
+def _clean_source_name(filename: str) -> str:
+    """Turn raw video filename into a readable label."""
+    stem = Path(filename).stem
+    # YTDown format: YTDown_YouTube_<Title-With-Dashes>_Media_<id>_NNN_1080p
+    if stem.startswith("YTDown_YouTube_"):
+        parts = stem.split("_Media_")[0]
+        title = parts.replace("YTDown_YouTube_", "").replace("-", " ")
+        return title.title()
+    # Remove common suffixes like _1080p, _720p, _workout
+    for suf in ("_1080p", "_720p", "_workout", "_highlights"):
+        stem = stem.replace(suf, "")
+    return stem.replace("_", " ").strip()
+
+
+@st.cache_data(show_spinner=False)
+def load_pose_clips(folder: str) -> list[dict]:
+    """Load all pose JSON files for a player, including source video info."""
+    clips_dir = VIDEO_DIR / folder / "jump_shot_clips"
+    clips = []
+    for p in sorted(clips_dir.glob("*_pose.json")):
+        if "summary" in p.name:
+            continue
+        data = json.loads(p.read_text())
+        if not data.get("trajectory"):
+            continue
+        clip_stem = p.stem.replace("_pose", "")
+        # Load source info from tracking JSON
+        source_video, anchor_sec, clip_start_sec = "", 0.0, 0.0
+        release_frame_off = None
+        tracking_path = clips_dir / f"{clip_stem}_tracking.json"
+        if tracking_path.exists():
+            tj = json.loads(tracking_path.read_text())
+            source_video      = tj.get("source_video", "")
+            anchor_sec        = tj.get("anchor_sec", 0.0)
+            fps               = tj.get("fps", 60.0)
+            clip_start_sec    = tj.get("clip_start_frame", 0) / fps
+            # Use manually annotated release_frame if available
+            # release_frame is already a clip-frame offset (0-based within clip)
+            if tj.get("release_frame") is not None:
+                release_frame_off = tj["release_frame"]
+        trajectory = data["trajectory"]
+
+        # Anchor x-axis: manual annotation > action-classifier frame (rel_frame=0)
+        if release_frame_off is not None:
+            for r in trajectory:
+                r["release_rel_frame"] = r["frame_offset"] - release_frame_off
+        else:
+            for r in trajectory:
+                r["release_rel_frame"] = r["rel_frame"]
+
+        valid_frames = sum(1 for f in trajectory if f.get("knee_angle") is not None)
+        clips.append({
+            "clip":           clip_stem,
+            "trajectory":     trajectory,
+            "stats":          data.get("stats", {}),
+            "source_video":   source_video,
+            "source_label":   _clean_source_name(source_video),
+            "anchor_sec":     anchor_sec,
+            "clip_start_sec": clip_start_sec,
+            "valid_frames":   valid_frames,
+        })
+    # Most complete clips first so the default view is the best quality
+    clips.sort(key=lambda c: -c["valid_frames"])
+    return clips
+
+
+def _trajectory_fig(clips: list[dict], metric: str, fps: float = 60.0) -> go.Figure:
+    meta   = METRICS_META[metric]
+    fig    = go.Figure()
+    colors = meta["color"]
+
+    # Per-clip lines (semi-transparent)
+    all_x, all_y_by_x = [], {}
+    for clip in clips:
+        xs = [r["release_rel_frame"] / fps for r in clip["trajectory"] if r.get(metric) is not None]
+        ys = [r[metric]                     for r in clip["trajectory"] if r.get(metric) is not None]
+        if not xs:
+            continue
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys,
+            mode="lines",
+            name=clip["clip"],
+            line=dict(color=colors, width=1.5),
+            opacity=0.35,
+            showlegend=True,
+            hovertemplate=f"{clip['clip']}<br>t=%{{x:.2f}}s  {metric}=%{{y:.1f}}<extra></extra>",
+        ))
+        for x, y in zip(xs, ys):
+            all_y_by_x.setdefault(round(x, 3), []).append(y)
+            all_x.append(x)
+
+    # Mean line
+    if all_y_by_x:
+        mx = sorted(all_y_by_x)
+        my = [float(np.mean(all_y_by_x[x])) for x in mx]
+        fig.add_trace(go.Scatter(
+            x=mx, y=my,
+            mode="lines",
+            name="Mean",
+            line=dict(color=colors, width=3),
+            opacity=1.0,
+            showlegend=True,
+            hovertemplate=f"Mean<br>t=%{{x:.2f}}s  {metric}=%{{y:.1f}}<extra></extra>",
+        ))
+
+    # Anchor line
+    fig.add_vline(x=0, line_dash="dash", line_color="#aaaaaa", line_width=1)
+    fig.add_annotation(x=0, y=1, yref="paper", text="release", showarrow=False,
+                       font=dict(size=10, color="#aaaaaa"), yanchor="top")
+
+    fig.update_layout(
+        title=dict(text=meta["label"], font=dict(size=14)),
+        xaxis=dict(title="Time from release (s)", zeroline=False,
+                   tickformat=".1f"),
+        yaxis=dict(title=meta["label"]),
+        height=320,
+        margin=dict(l=50, r=20, t=40, b=40),
+        legend=dict(font=dict(size=10), orientation="h",
+                    yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor="#fafafa",
+        paper_bgcolor="#ffffff",
+        hovermode="x unified",
+    )
+    return fig
+
+
+def _single_clip_fig(clip: dict, all_clips: list[dict],
+                     metric: str, fps: float = 60.0) -> go.Figure:
+    """One clip highlighted, all-clip mean as grey reference."""
+    meta  = METRICS_META[metric]
+    color = meta["color"]
+    fig   = go.Figure()
+
+    # Grey reference lines for all other clips
+    for c in all_clips:
+        if c["clip"] == clip["clip"]:
+            continue
+        xs = [r["release_rel_frame"] / fps for r in c["trajectory"] if r.get(metric) is not None]
+        ys = [r[metric]                     for r in c["trajectory"] if r.get(metric) is not None]
+        if not xs:
+            continue
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines",
+            line=dict(color="#cccccc", width=1),
+            opacity=0.5, showlegend=False,
+            hoverinfo="skip",
+        ))
+
+    # Mean line
+    all_y_by_x: dict[float, list] = {}
+    for c in all_clips:
+        for r in c["trajectory"]:
+            if r.get(metric) is not None:
+                k = round(r["release_rel_frame"] / fps, 3)
+                all_y_by_x.setdefault(k, []).append(r[metric])
+    if all_y_by_x:
+        mx = sorted(all_y_by_x)
+        my = [float(np.mean(all_y_by_x[x])) for x in mx]
+        fig.add_trace(go.Scatter(
+            x=mx, y=my, mode="lines", name="All-clip mean",
+            line=dict(color="#888888", width=2, dash="dot"),
+            opacity=0.8, showlegend=True,
+        ))
+
+    # Selected clip — highlighted
+    xs = [r["release_rel_frame"] / fps for r in clip["trajectory"] if r.get(metric) is not None]
+    ys = [r[metric]                     for r in clip["trajectory"] if r.get(metric) is not None]
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="lines+markers", name=clip["clip"],
+        line=dict(color=color, width=2.5),
+        marker=dict(size=4, color=color),
+        showlegend=True,
+        hovertemplate=f"t=%{{x:.2f}}s<br>{metric}=%{{y:.1f}}<extra></extra>",
+    ))
+
+    fig.add_vline(x=0, line_dash="dash", line_color="#aaaaaa", line_width=1)
+    fig.add_annotation(x=0, y=1, yref="paper", text="release", showarrow=False,
+                       font=dict(size=10, color="#aaaaaa"), yanchor="top")
+
+    fig.update_layout(
+        title=dict(text=meta["label"], font=dict(size=13)),
+        xaxis=dict(title="Time from release (s)", zeroline=False, tickformat=".1f"),
+        yaxis=dict(title=meta["label"]),
+        height=260,
+        margin=dict(l=50, r=10, t=36, b=36),
+        legend=dict(font=dict(size=10), orientation="h",
+                    yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor="#fafafa", paper_bgcolor="#ffffff",
+        hovermode="x",
+    )
+    return fig
+
+
+def _snapshot_metrics(clips: list[dict]) -> dict:
+    """Compute scouting snapshot cards across all clips for a player."""
+    load_depths, arm_setups, release_leans = [], [], []
+
+    for c in clips:
+        traj = c["trajectory"]
+
+        knee_indexed  = [(i, r["knee_angle"])  for i, r in enumerate(traj) if r.get("knee_angle")  is not None]
+        elbow_indexed = [(i, r["elbow_angle"]) for i, r in enumerate(traj) if r.get("elbow_angle") is not None]
+        lean_indexed  = [(i, r["body_lean"])   for i, r in enumerate(traj) if r.get("body_lean")   is not None]
+
+        if knee_indexed:
+            min_knee = min(v for _, v in knee_indexed)
+            load_depths.append(min_knee)
+
+            # Loading window = frames within 15° of the deepest knee bend
+            load_idxs = {i for i, v in knee_indexed if v <= min_knee + 15}
+
+            # Arm setup = mean elbow angle during loading window
+            load_elbow = [v for i, v in elbow_indexed if i in load_idxs]
+            if load_elbow:
+                arm_setups.append(float(np.mean(load_elbow)))
+
+        # Release lean = mean body lean in ±3 frames around the re-anchored release (frame 0)
+        near_release = [r["body_lean"] for r in traj
+                        if r.get("body_lean") is not None
+                        and abs(r.get("release_rel_frame", 9999)) <= 3]
+        if near_release:
+            release_leans.append(float(np.mean(near_release)))
+
+    return {
+        "load_depth_mean":   round(float(np.mean(load_depths)),   1) if load_depths   else None,
+        "load_depth_std":    round(float(np.std(load_depths)),    1) if len(load_depths) > 1   else None,
+        "arm_setup_mean":    round(float(np.mean(arm_setups)),    1) if arm_setups    else None,
+        "release_lean_mean": round(float(np.mean(release_leans)), 1) if release_leans else None,
+        "n_clips":           len(clips),
+    }
+
+
+def page_shot_mechanics(bios: dict) -> None:
+    st.markdown("## 🎯 Shot Mechanics")
+
+    # Only show players ranked ≤ 10 who have pose data
+    mechanics_names = [
+        name for name, folder in MECHANICS_PLAYERS.items()
+        if folder is not None and PROSPECT_META.get(name, {}).get("rank", 9999) <= 10
+    ]
+    mechanics_names.sort(key=lambda n: PROSPECT_META.get(n, {}).get("rank", 9999))
+
+    with st.sidebar:
+        st.markdown("### Player")
+        player_name = st.selectbox(
+            "Select player", mechanics_names,
+            label_visibility="collapsed",
+        )
+
+    folder = MECHANICS_PLAYERS.get(player_name)
+    if folder is None:
+        st.info(f"Pose data for **{player_name}** not yet processed.")
+        return
+
+    clips = load_pose_clips(folder)
+    if not clips:
+        st.warning(f"No pose clips found for {player_name}.")
+        return
+
+    clips_dir = VIDEO_DIR / folder / "jump_shot_clips"
+
+    # ── Profile header + scouting snapshot ───────────────────────────────────
+    snap = _snapshot_metrics(clips)
+    bio  = bios.get(player_name, {})
+    meta = PROSPECT_META.get(player_name, {})
+
+    headshot = bio.get("headshot_url", "")
+    position = bio.get("position") or meta.get("position", "")
+    team     = meta.get("team", bio.get("team", ""))
+    rank     = meta.get("rank", "")
+    height   = bio.get("height", "")
+    weight   = bio.get("weight", "")
+
+    prof_col, snap_col = st.columns([1, 2])
+
+    with prof_col:
+        img_html = ""
+        if headshot:
+            img_html = (f'<img src="{headshot}" style="width:90px;height:90px;'
+                        f'border-radius:50%;object-fit:cover;'
+                        f'border:3px solid #f0b429;background:#1a1a2e;'
+                        f'float:left;margin-right:14px;" '
+                        f'onerror="this.style.display:\'none\'">')
+        pills = []
+        if rank:     pills.append(f"#{rank} Overall")
+        if position: pills.append(position)
+        if team:     pills.append(team)
+        if height:   pills.append(height)
+        if weight:   pills.append(weight)
+        pills_html = " · ".join(f"<span style='color:#f0b429;font-weight:600'>{p}</span>" for p in pills[:2])
+        rest_html  = " · ".join(pills[2:])
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:14px;padding:8px 0">'
+            f'{img_html}'
+            f'<div><div style="font-size:22px;font-weight:700;color:#1a1a2e">{player_name}</div>'
+            f'<div style="margin-top:4px;font-size:13px">{pills_html}</div>'
+            f'<div style="margin-top:2px;font-size:12px;color:#666">{rest_html}</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(f"Based on {snap['n_clips']} clips")
+
+    with snap_col:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            "Load Depth",
+            f"{snap['load_depth_mean']:.0f}°" if snap["load_depth_mean"] is not None else "—",
+            help="Mean minimum knee angle across clips — lower = deeper squat, more leg drive",
+        )
+        m2.metric(
+            "Consistency",
+            f"±{snap['load_depth_std']:.1f}°" if snap["load_depth_std"] is not None else "—",
+            help="Std of load depth across clips — lower = more repeatable mechanics",
+        )
+        m3.metric(
+            "Arm Setup",
+            f"{snap['arm_setup_mean']:.0f}°" if snap["arm_setup_mean"] is not None else "—",
+            help="Mean elbow angle during the loading phase — lower = more compact arm set",
+        )
+        m4.metric(
+            "Release Lean",
+            f"{snap['release_lean_mean']:+.1f}°" if snap["release_lean_mean"] is not None else "—",
+            help="Mean body lean at release — negative = leaning back, positive = leaning forward",
+        )
+
+    st.markdown("---")
+
+    # ── Clip navigation ───────────────────────────────────────────────────────
+    idx_key = f"mech_clip_idx_{player_name}"
+    st.session_state.setdefault(idx_key, 0)
+    n_clips = len(clips)
+
+    st.markdown("""
+<style>
+div[data-testid="stHorizontalBlock"]:has(video) {
+    gap: 0.25rem !important;
+    align-items: center !important;
+}
+div[data-testid="stHorizontalBlock"]:has(video) > div[data-testid="column"]:first-child,
+div[data-testid="stHorizontalBlock"]:has(video) > div[data-testid="column"]:last-child {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 0 !important;
+}
+div[data-testid="stHorizontalBlock"]:has(video) button[data-testid="baseButton-secondary"] {
+    font-size: 2rem !important;
+    height: 5rem !important;
+    width: 100% !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    color: #ccc !important;
+}
+div[data-testid="stHorizontalBlock"]:has(video) button[data-testid="baseButton-secondary"]:hover:not(:disabled) {
+    color: #fff !important;
+    background: transparent !important;
+}
+div[data-testid="stHorizontalBlock"]:has(video) button[data-testid="baseButton-secondary"]:disabled {
+    opacity: 0.2 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+    selected_idx = st.session_state[idx_key]
+    clip = clips[selected_idx]
+
+    stem       = Path(clip['clip']).stem
+    web_path   = clips_dir / f"{stem}_pose_preview_web.mp4"
+    raw_path   = clips_dir / f"{stem}_pose_preview.mp4"
+    video_path = web_path if web_path.exists() else raw_path
+
+    # ── Video + nav buttons ───────────────────────────────────────────────────
+    nav_l, vid_col, nav_r = st.columns([0.5, 5, 0.5])
+
+    with nav_l:
+        if st.button("◀", key="mech_prev", use_container_width=True,
+                     disabled=(selected_idx == 0)):
+            st.session_state[idx_key] = selected_idx - 1
+            st.rerun()
+    with vid_col:
+        if video_path.exists():
+            st.video(str(video_path), autoplay=True)
+        else:
+            st.warning("Video not found")
+        st.caption(f"📁 {clip['source_label']}")
+    with nav_r:
+        if st.button("▶", key="mech_next", use_container_width=True,
+                     disabled=(selected_idx >= n_clips - 1)):
+            st.session_state[idx_key] = selected_idx + 1
+            st.rerun()
+
+    # ── Trajectory charts ─────────────────────────────────────────────────────
+    st.caption(
+        "**Colored line** = this clip · **dotted grey** = player mean · "
+        "faint grey = other clips · dashed vertical = release point"
+    )
+    c1, c2, c3 = st.columns(3)
+    for col, metric in [(c1, "knee_angle"), (c2, "elbow_angle"), (c3, "body_lean")]:
+        fig = _single_clip_fig(clip, clips, metric)
+        col.plotly_chart(fig, use_container_width=True)
+        col.caption(METRIC_DESCRIPTIONS[metric])
+
 
 # ── App entry point ───────────────────────────────────────────────────────────
 
@@ -2796,6 +3260,7 @@ def main() -> None:
     bios             = load_bios()
     intl_stats       = load_intl_stats()
     box_scores       = load_box_scores()
+    combine          = load_combine()
     all_scores       = compute_all_report_scores(shots, summary)
 
     with st.sidebar:
@@ -2803,16 +3268,18 @@ def main() -> None:
         st.caption("Shot Quality Scouting Portal")
         st.markdown("---")
         page = st.radio("Navigate",
-                        ["📋 Draft Board", "👤 Player Dossier", "⚖️ Head-to-Head"],
+                        ["📋 Draft Board", "👤 Player Dossier", "⚖️ Head-to-Head", "🎯 Shot Mechanics"],
                         label_visibility="collapsed",
                         key="nav_page")
 
     if page == "📋 Draft Board":
         page_draft_board(shots, summary, bios, all_scores, box_scores)
     elif page == "👤 Player Dossier":
-        page_player_dossier(shots, summary, all_ncaa_summary, bios, intl_stats, all_scores, box_scores)
+        page_player_dossier(shots, summary, all_ncaa_summary, bios, intl_stats, all_scores, box_scores, combine)
+    elif page == "⚖️ Head-to-Head":
+        page_h2h(shots, summary, bios, intl_stats, all_scores, box_scores, combine)
     else:
-        page_h2h(shots, summary, bios, intl_stats, all_scores, box_scores)
+        page_shot_mechanics(bios)
 
 
 if __name__ == "__main__":
