@@ -125,7 +125,7 @@ st.markdown("""
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400)
 def load_box_scores() -> pd.DataFrame:
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -142,7 +142,7 @@ def load_box_scores() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400)
 def load_shots(league: str = "NCAA") -> pd.DataFrame:
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(f"SELECT * FROM shots WHERE league='{league}'", conn)
@@ -150,7 +150,7 @@ def load_shots(league: str = "NCAA") -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400)
 def load_summary(league: str | None = None, season: str | None = None) -> pd.DataFrame:
     conn = sqlite3.connect(DB_PATH)
     conditions, params = [], []
@@ -1639,7 +1639,7 @@ ZONE_ORDER = [
 ]
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400)
 def compute_all_report_scores(shots: pd.DataFrame,
                               summary: pd.DataFrame) -> pd.DataFrame:
     """
