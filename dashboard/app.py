@@ -2000,7 +2000,8 @@ def page_shooting_report(shots: pd.DataFrame, summary: pd.DataFrame,
 
 def page_draft_board(shots: pd.DataFrame, summary: pd.DataFrame,
                      bios: dict, all_scores: pd.DataFrame,
-                     box_scores: pd.DataFrame | None = None) -> None:
+                     box_scores: pd.DataFrame | None = None,
+                     combine: dict | None = None) -> None:
     st.markdown("## 📋 2026 NBA Draft Board")
 
     if summary.empty:
@@ -2143,6 +2144,64 @@ def page_draft_board(shots: pd.DataFrame, summary: pd.DataFrame,
             st.session_state["dossier_player"] = clicked_name
             st.session_state["_nav_request"] = "👤 Player Dossier"
             st.rerun()
+
+    # ── Combine Shooting Comparison ──────────────────────────────────────────
+    if combine:
+        st.markdown("---")
+        st.markdown("### 🏋️ Combine Shooting Drills — All Prospects")
+
+        # Build combine rows for all players in current filtered view
+        combine_rows = []
+        for pname in name_order:
+            cdata = combine.get(pname, {})
+            cs   = cdata.get("COLLEGE_CORNER_LEFT_PCT")
+            od   = cdata.get("OFF_DRIB_COLLEGE_BREAK_LEFT_PCT")
+            star = cdata.get("ON_MOVE_COLLEGE_PCT")
+            side = cdata.get("THREE_PT_SIDE_PCT")
+            ft   = cdata.get("FREETHROW_PCT")
+
+            # Game 3PT% for this player
+            g3 = (three_made.loc[pname, "three_pct"]
+                  if pname in three_made.index else None)
+            # gap: combine C&S vs game 3PT (positive = combine better)
+            gap = round((cs - g3) * 100, 1) if (cs is not None and g3 is not None) else None
+
+            combine_rows.append({
+                "Player":          pname,
+                "C&S%":            f"{cs:.0%}"   if cs   is not None else "—",
+                "Off-Drib%":       f"{od:.0%}"   if od   is not None else "—",
+                "3PT Star%":       f"{star:.0%}" if star is not None else "—",
+                "3PT Side%":       f"{side:.0%}" if side is not None else "—",
+                "FT%":             f"{ft:.0%}"   if ft   is not None else "—",
+                "Game 3PT%":       f"{g3:.0%}"   if g3   is not None and pd.notna(g3) else "—",
+                "C&S vs Game (pp)": f"{gap:+.1f}" if gap is not None else "—",
+            })
+
+        cdf = pd.DataFrame(combine_rows)
+        st.dataframe(
+            cdf.set_index("Player"),
+            column_config={
+                "C&S%":             st.column_config.TextColumn("C&S%",            width="small"),
+                "Off-Drib%":        st.column_config.TextColumn("Off-Drib%",        width="small"),
+                "3PT Star%":        st.column_config.TextColumn("3PT Star%",        width="small"),
+                "3PT Side%":        st.column_config.TextColumn("3PT Side%",        width="small"),
+                "FT%":              st.column_config.TextColumn("FT%",             width="small"),
+                "Game 3PT%":        st.column_config.TextColumn("Game 3PT%",        width="small"),
+                "C&S vs Game (pp)": st.column_config.TextColumn("C&S vs Game (pp)", width="small",
+                                    help="Combine C&S% minus actual game 3PT% (percentage points). "
+                                         "Large positive = combine > game → untapped potential."),
+            },
+            use_container_width=True,
+            height=420,
+        )
+        st.caption(
+            "**C&S%** — Combine catch-and-shoot (stationary, college 3PT).  ·  "
+            "**Off-Drib%** — Off-dribble pull-up.  ·  "
+            "**3PT Star%** — Star-pattern run & shoot.  ·  "
+            "**3PT Side%** — Side 3PT spot-up.  ·  "
+            "**C&S vs Game (pp)** — Combine C&S% minus game 3PT% in percentage points. "
+            "Large positive = mechanics exist in isolation; game-speed execution is the gap."
+        )
 
     # ── Metric glossary ───────────────────────────────────────────────────────
     st.markdown("---")
@@ -2618,6 +2677,57 @@ def page_player_dossier(shots: pd.DataFrame, summary: pd.DataFrame,
 
             st.markdown("<br>", unsafe_allow_html=True)
 
+            # ── Combine Shooting Drills ───────────────────────────────────────
+            cs_pct   = cdata.get("COLLEGE_CORNER_LEFT_PCT")
+            od_pct   = cdata.get("OFF_DRIB_COLLEGE_BREAK_LEFT_PCT")
+            om_pct   = cdata.get("ON_MOVE_COLLEGE_PCT")
+            side_pct = cdata.get("THREE_PT_SIDE_PCT")
+            ft_pct   = cdata.get("FREETHROW_PCT")
+
+            if any(v is not None for v in [cs_pct, od_pct, om_pct]):
+                section_header("Combine Shooting Drills")
+                d1, d2, d3, d4 = st.columns(4)
+                metric_card(d1, "Catch & Shoot",
+                            f"{cs_pct:.0%}" if cs_pct is not None else "—",
+                            _combine_rank(combine, "COLLEGE_CORNER_LEFT_PCT", cs_pct))
+                metric_card(d2, "Off Dribble",
+                            f"{od_pct:.0%}" if od_pct is not None else "—",
+                            _combine_rank(combine, "OFF_DRIB_COLLEGE_BREAK_LEFT_PCT", od_pct))
+                metric_card(d3, "3PT Star (On Move)",
+                            f"{om_pct:.0%}" if om_pct is not None else "—",
+                            _combine_rank(combine, "ON_MOVE_COLLEGE_PCT", om_pct))
+
+                # C&S Premium — coachability indicator
+                if cs_pct is not None and od_pct is not None:
+                    premium = cs_pct - od_pct
+                    if premium > 0.15:
+                        label = "Shot Creator (needs work)"
+                    elif premium > 0.05:
+                        label = "C&S Specialist"
+                    else:
+                        label = "Versatile Shooter"
+                    metric_card(d4, "C&S Premium",
+                                f"{premium:+.0%}",
+                                label)
+                else:
+                    metric_card(d4, "C&S Premium", "—", "")
+
+                e1, e2, e3, e4 = st.columns(4)
+                metric_card(e1, "3PT Side",
+                            f"{side_pct:.0%}" if side_pct is not None else "—",
+                            _combine_rank(combine, "THREE_PT_SIDE_PCT", side_pct))
+                metric_card(e2, "Free Throw",
+                            f"{ft_pct:.0%}" if ft_pct is not None else "—",
+                            _combine_rank(combine, "FREETHROW_PCT", ft_pct))
+
+                st.caption(
+                    "All shooting drills at college 3PT distance. "
+                    "**C&S Premium** = Catch-&-Shoot% − Off-Dribble%: "
+                    "large positive → good mechanics, shot creation needs coaching."
+                )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
 
 
 
@@ -2771,9 +2881,11 @@ def page_h2h(shots: pd.DataFrame, summary: pd.DataFrame,
             ("Max Vertical",       "MAX_VERTICAL_LEAP",      '{:.1f}"',   False),
             ("Lane Agility",       "LANE_AGILITY_TIME",      "{:.2f}s",   True),
             ("¾ Sprint",           "THREE_QUARTER_SPRINT",   "{:.2f}s",   True),
-            ("Spot 3PT% (college)","COLLEGE_TOP_KEY_PCT",    "{:.0%}",    False),
-            ("Off-Drib 3PT%",      "OFF_DRIB_COLLEGE_TOP_KEY_PCT", "{:.0%}", False),
-            ("On-Move 3PT%",       "ON_MOVE_COLLEGE_PCT",    "{:.0%}",    False),
+            ("Catch & Shoot 3PT%",  "COLLEGE_CORNER_LEFT_PCT",         "{:.0%}", False),
+            ("Off-Drib 3PT%",      "OFF_DRIB_COLLEGE_BREAK_LEFT_PCT", "{:.0%}", False),
+            ("3PT Star (On Move)", "ON_MOVE_COLLEGE_PCT",             "{:.0%}", False),
+            ("3PT Side",           "THREE_PT_SIDE_PCT",               "{:.0%}", False),
+            ("Free Throw%",        "FREETHROW_PCT",                   "{:.0%}", False),
         ]
 
         html = f"""
@@ -3240,6 +3352,7 @@ div[data-testid="stHorizontalBlock"]:has(video) button[data-testid="baseButton-s
         col.caption(METRIC_DESCRIPTIONS[metric])
 
 
+
 # ── App entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -3273,7 +3386,7 @@ def main() -> None:
                         key="nav_page")
 
     if page == "📋 Draft Board":
-        page_draft_board(shots, summary, bios, all_scores, box_scores)
+        page_draft_board(shots, summary, bios, all_scores, box_scores, combine)
     elif page == "👤 Player Dossier":
         page_player_dossier(shots, summary, all_ncaa_summary, bios, intl_stats, all_scores, box_scores, combine)
     elif page == "⚖️ Head-to-Head":
